@@ -1,0 +1,646 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * ATK-DLRK3568 / RK3568 自定义精简设备树
+ *
+ * 目标：只保留「系统正常启动 + 串口调试」，其余外设一律不使能。
+ *   1. 启动链：SoC 顶层(rk3568.dtsi) + 调试/启动参数(rk3568-linux.dtsi)
+ *   2. 电源   ：RK809(系统电源控制器, 提供 vdd_logic 及各路 IO 电源) + TCS4525(vdd_cpu)
+ *   3. 串口   ：UART2_M0(GPIO0_D0/D1) -> ttyFIQ0, 1500000bps
+ *   4. 存储   ：eMMC(sdhci) + TF 卡(sdmmc0)
+ *   5. 其余   ：display/ethernet/usb/wifi-bt/camera/audio/pcie-sata/saradc... 全部不使能
+ *
+ * 说明：
+ *   - /memory 节点由 U-Boot 运行时注入，dts 里不需要写；
+ *   - bootargs 来自 rk3568-linux.dtsi（root=PARTUUID=614e0000-0000 与 parameter 文件中的
+ *     uuid:rootfs=614e0000-0000 一致），U-Boot 传入的 bootargs 会覆盖它；
+ *   - pmu_io_domains 的电压必须与硬件实际供电一致，否则可能损坏 SoC！见文件末尾注释。
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+#include "rk3568.dtsi"
+#include "rk3568-linux.dtsi"
+
+/ {
+	model = "ATK-DLRK3568 Custom Board";
+	compatible = "alientek,rk3568-atk-custom", "rockchip,rk3568";
+
+	/* 12V 适配器输入 */
+	dc_12v: dc-12v {
+		compatible = "regulator-fixed";
+		regulator-name = "dc_12v";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <12000000>;
+		regulator-max-microvolt = <12000000>;
+	};
+
+	vcc5v0_sys: vcc5v0-sys {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc5v0_sys";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		vin-supply = <&dc_12v>;
+	};
+
+	vcc3v3_sys: vcc3v3-sys {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc3v3_sys";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		vin-supply = <&dc_12v>;
+	};
+
+	/* 如果需要固定 bootargs，可在此覆盖 rk3568-linux.dtsi 中的默认值
+	chosen: chosen {
+		bootargs = "earlycon=uart8250,mmio32,0xfe660000 console=ttyFIQ0 root=PARTUUID=614e0000-0000 rw rootwait";
+	};
+	*/
+};
+
+/*
+ * 调试串口（板载 USB 转串口接在此口）: RK3568默认串口, 无需配置okay
+ * rk3568.dtsi 中默认 pinctrl-0 = <&uart2m0_xfer>，无需重复配置
+ * 控制台设备: /dev/ttyFIQ0 (fiq-debugger, 1500000bps)
+ */
+&uart2 {
+	status = "disabled";
+};
+
+/*
+ * I2C0 上的电源管理芯片
+ *  - RK809: 系统电源控制器, 提供 vdd_logic/vdd_gpu/vdd_npu/vcc_ddr 及各路 IO 电源
+ *  - TCS4525: CPU 核心电压(vdd_cpu), 用于 CPU DVFS
+ * 注意: RK809 电源是板级基础电源, 不是“外设”, 必须保留;
+ *       若自制板没有 TCS4525, 请删除 tcs4525 节点和下面的 &cpu0 节点。
+ */
+&i2c0 {
+	status = "okay";
+
+	vdd_cpu: tcs4525@1c {
+		compatible = "tcs,tcs4525";
+		reg = <0x1c>;
+		vin-supply = <&vcc5v0_sys>;
+		regulator-compatible = "fan53555-reg";
+		regulator-name = "vdd_cpu";
+		regulator-min-microvolt = <712500>;
+		regulator-max-microvolt = <1390000>;
+		regulator-init-microvolt = <900000>;
+		regulator-ramp-delay = <2300>;
+		fcs,suspend-voltage-selector = <1>;
+		regulator-boot-on;
+		regulator-always-on;
+		regulator-state-mem {
+			regulator-off-in-suspend;
+		};
+	};
+
+	rk809: pmic@20 {
+		compatible = "rockchip,rk809";
+		reg = <0x20>;
+		interrupt-parent = <&gpio0>;
+		interrupts = <3 IRQ_TYPE_LEVEL_LOW>;
+
+		pinctrl-names = "default", "pmic-sleep",
+				"pmic-power-off", "pmic-reset";
+		pinctrl-0 = <&pmic_int>;
+		pinctrl-1 = <&soc_slppin_slp>, <&rk817_slppin_slp>;
+		pinctrl-2 = <&soc_slppin_gpio>, <&rk817_slppin_pwrdn>;
+		pinctrl-3 = <&soc_slppin_gpio>, <&rk817_slppin_rst>;
+
+		rockchip,system-power-controller;
+		wakeup-source;
+		#clock-cells = <1>;
+		clock-output-names = "rk808-clkout1", "rk808-clkout2";
+		/* 1: rst regs (default in codes), 0: rst the pmic */
+		pmic-reset-func = <0>;
+		/* not save the PMIC_POWER_EN register in uboot */
+		not-save-power-en = <1>;
+
+		vcc1-supply = <&vcc3v3_sys>;
+		vcc2-supply = <&vcc3v3_sys>;
+		vcc3-supply = <&vcc3v3_sys>;
+		vcc4-supply = <&vcc3v3_sys>;
+		vcc5-supply = <&vcc3v3_sys>;
+		vcc6-supply = <&vcc3v3_sys>;
+		vcc7-supply = <&vcc3v3_sys>;
+		vcc8-supply = <&vcc3v3_sys>;
+		vcc9-supply = <&vcc3v3_sys>;
+
+		pwrkey {
+			status = "okay";
+		};
+
+		pinctrl_rk8xx: pinctrl_rk8xx {
+			gpio-controller;
+			#gpio-cells = <2>;
+
+			rk817_slppin_null: rk817_slppin_null {
+				pins = "gpio_slp";
+				function = "pin_fun0";
+			};
+
+			rk817_slppin_slp: rk817_slppin_slp {
+				pins = "gpio_slp";
+				function = "pin_fun1";
+			};
+
+			rk817_slppin_pwrdn: rk817_slppin_pwrdn {
+				pins = "gpio_slp";
+				function = "pin_fun2";
+			};
+
+			rk817_slppin_rst: rk817_slppin_rst {
+				pins = "gpio_slp";
+				function = "pin_fun3";
+			};
+		};
+
+		regulators {
+			vdd_logic: DCDC_REG1 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <1350000>;
+				regulator-init-microvolt = <900000>;
+				regulator-ramp-delay = <6001>;
+				regulator-initial-mode = <0x2>;
+				regulator-name = "vdd_logic";
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vdd_gpu: DCDC_REG2 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <1350000>;
+				regulator-init-microvolt = <900000>;
+				regulator-ramp-delay = <6001>;
+				regulator-initial-mode = <0x2>;
+				regulator-name = "vdd_gpu";
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc_ddr: DCDC_REG3 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-initial-mode = <0x2>;
+				regulator-name = "vcc_ddr";
+				regulator-state-mem {
+					regulator-on-in-suspend;
+				};
+			};
+
+			vdd_npu: DCDC_REG4 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <1350000>;
+				regulator-init-microvolt = <900000>;
+				regulator-ramp-delay = <6001>;
+				regulator-initial-mode = <0x2>;
+				regulator-name = "vdd_npu";
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vdda0v9_image: LDO_REG1 {
+				regulator-boot-on;
+				regulator-always-on;
+				regulator-min-microvolt = <900000>;
+				regulator-max-microvolt = <900000>;
+				regulator-name = "vdda0v9_image";
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vdda_0v9: LDO_REG2 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <900000>;
+				regulator-max-microvolt = <900000>;
+				regulator-name = "vdda_0v9";
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vdda0v9_pmu: LDO_REG3 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <900000>;
+				regulator-max-microvolt = <900000>;
+				regulator-name = "vdda0v9_pmu";
+				regulator-state-mem {
+					regulator-on-in-suspend;
+					regulator-suspend-microvolt = <900000>;
+				};
+			};
+
+			vccio_acodec: LDO_REG4 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <3000000>;
+				regulator-max-microvolt = <3000000>;
+				regulator-name = "vccio_acodec";
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vccio_sd: LDO_REG5 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <3300000>;
+				regulator-name = "vccio_sd";
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc3v3_pmu: LDO_REG6 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+				regulator-name = "vcc3v3_pmu";
+				regulator-state-mem {
+					regulator-on-in-suspend;
+					regulator-suspend-microvolt = <3300000>;
+				};
+			};
+
+			vcca_1v8: LDO_REG7 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcca_1v8";
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcca1v8_pmu: LDO_REG8 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcca1v8_pmu";
+				regulator-state-mem {
+					regulator-on-in-suspend;
+					regulator-suspend-microvolt = <1800000>;
+				};
+			};
+
+			vcca1v8_image: LDO_REG9 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcca1v8_image";
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc_1v8: DCDC_REG5 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcc_1v8";
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc_3v3: SWITCH_REG1 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-name = "vcc_3v3";
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+
+			vcc3v3_sd: SWITCH_REG2 {
+				regulator-always-on;
+				regulator-boot-on;
+				regulator-name = "vcc3v3_sd";
+				regulator-state-mem {
+					regulator-off-in-suspend;
+				};
+			};
+		};
+	};
+};
+
+/* CPU 核心电压由 TCS4525 提供，用于 CPU DVFS；无此器件请整段删除 */
+&cpu0 {
+	cpu-supply = <&vdd_cpu>;
+};
+
+/* eMMC：系统（rootfs）启动盘，引脚为 eMMC 专用引脚，无需 pinctrl */
+&sdhci {
+	bus-width = <8>;
+	no-sdio;
+	no-sd;
+	non-removable;
+	max-frequency = <200000000>;
+	full-pwr-cycle-in-suspend;
+	status = "okay";
+};
+
+/* TF 卡（sdmmc0） */
+&sdmmc0 {
+	max-frequency = <150000000>;
+	no-sdio;
+	no-mmc;
+	bus-width = <4>;
+	cap-mmc-highspeed;
+	cap-sd-highspeed;
+	disable-wp;
+	sd-uhs-sdr104;
+	vmmc-supply = <&vcc3v3_sd>;
+	vqmmc-supply = <&vccio_sd>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdmmc0_bus4 &sdmmc0_clk &sdmmc0_cmd &sdmmc0_det>;
+	status = "okay";
+};
+
+/* 仅使能 SoC 内部温度传感器，供 thermal 使用（非外设） */
+&tsadc {
+	status = "okay";
+};
+
+/*
+ * IO 电压域配置（驱动: drivers/soc/rockchip/io-domain.c）
+ * 必须与硬件实际连接的电源一致，否则会配置错误甚至损坏 SoC。
+ * 下面取值与 rk3568-atk-evb1-ddr4-v10.dtsi + rk3568-evb.dtsi 叠加后的最终结果一致：
+ *   vccio4 / vccio6 = 1.8V(vcc_1v8)，其余如上。
+ * VCCIO2 由 FLASH_VOL_SEL/GPIO0_A7 硬件选择，无需软件配置。
+ */
+&pmu_io_domains {
+	status = "okay";
+	pmuio2-supply = <&vcc3v3_pmu>;
+	vccio1-supply = <&vccio_acodec>;
+	vccio3-supply = <&vccio_sd>;
+	vccio4-supply = <&vcc_1v8>;
+	vccio5-supply = <&vcc_3v3>;
+	vccio6-supply = <&vcc_1v8>;
+	vccio7-supply = <&vcc_3v3>;
+};
+
+/* 板级 pinctrl：PMIC 中断脚 / 休眠控制脚 */
+&pinctrl {
+	pmic {
+		pmic_int: pmic-int {
+			rockchip,pins = <0 RK_PA3 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+
+		soc_slppin_gpio: soc-slppin-gpio {
+			rockchip,pins = <0 RK_PA2 RK_FUNC_GPIO &pcfg_output_low>;
+		};
+
+		soc_slppin_slp: soc-slppin-slp {
+			rockchip,pins = <0 RK_PA2 1 &pcfg_pull_none>;
+		};
+
+		soc_slppin_rst: soc-slppin-rst {
+			rockchip,pins = <0 RK_PA2 2 &pcfg_pull_none>;
+		};
+	};
+};
+
+/*
+GMAC: 时钟 125MHz, 双边沿采样, 4bit并行传输. Tx[0]-TX[3], Rx[0]-Rx[3]
+
+GMAC控制 <-> GMAC DMA <-> Tx/Rx
+*/
+&mdio0 {
+	rgmii_phy0: phy@0 {
+		compatible = "ethernet-phy-ieee802.3-c22";
+		//reg = <0x0>;
+	};
+};
+
+&gmac0 {
+	phy-mode = "rgmii";
+	clock_in_out = "output";
+
+	/* 接入的是YT8531C的复位引脚 */
+	snps,reset-gpio = <&gpio2 RK_PD3 GPIO_ACTIVE_LOW>;
+	snps,reset-active-low;
+	/* Reset time is 20ms, 100ms for rtl8211f */
+	snps,reset-delays-us = <0 20000 100000>;
+
+	assigned-clocks = <&cru SCLK_GMAC0_RX_TX>, <&cru SCLK_GMAC0>;
+	assigned-clock-parents = <&cru SCLK_GMAC0_RGMII_SPEED>, <&cru CLK_MAC0_2TOP>;
+	assigned-clock-rates = <0>, <125000000>;
+
+	pinctrl-names = "default";
+	pinctrl-0 = <&gmac0_miim
+		     &gmac0_tx_bus2
+		     &gmac0_rx_bus2
+		     &gmac0_rgmii_clk
+		     &gmac0_rgmii_bus>;
+	
+	tx_delay = <0x24>;
+	rx_delay = <0x33>;
+
+	phy-handle = <&rgmii_phy0>;
+	status = "okay";
+};
+
+/*
+视频子系统
+	IMX415, I2C
+	MIPI D-PHY
+	MIPI CSI-2
+	VICAP
+	ISP
+	RGA
+
+SoC
+	1. D-PHY
+		// D-PHY 硬件IP
+		csi2_dphy_hw: csi2-dphy-hw@fe870000 {
+		
+		}
+
+		// PHY0, PHY1, PHY2, 3个逻辑通道. 使用的硬件都是csi2_dphy_hw
+		csi2_dphy0: csi2-dphy0 {
+			rockchip,hw = <&csi2_dphy_hw>;
+		};
+
+		csi2_dphy1: csi2-dphy1 {
+			rockchip,hw = <&csi2_dphy_hw>;
+		};
+
+		csi2_dphy2: csi2-dphy2 {
+			rockchip,hw = <&csi2_dphy_hw>;
+		};
+
+	2. MIPI CSI
+		// MIPI CSI Host
+		mipi_csi2_hw: mipi-csi2-hw@fdfb0000{
+		
+		}
+		mipi_csi2: mipi-csi2 {
+			rockchip,hw = <&mipi_csi2_hw>;
+		};
+	
+	3. VICAP
+		// 
+		rkcif: rkcif@fdfe0000 {
+
+		}
+
+		rkcif_mmu: iommu@fdfe0800 {
+		
+		}
+
+	4. ISP
+		rkisp: rkisp@fdff0000 {
+
+		}
+
+		rkisp_mmu: iommu@fdff1a00 {
+		
+		}
+
+		rkisp_vir0: rkisp-vir0 {
+			rockchip,hw = <&rkisp>;
+		}
+
+		rkisp_vir1: rkisp-vir1 {
+			rockchip,hw = <&rkisp>;
+		}
+
+通道
+	1. Sensor -> MIPI D-PHY -> ISP
+	2. Sensor -> MIPI D-PHY 
+
+情况1:
+	Sensor -> MIPI D-PHY -> MIPI CSI-2 -> VICAP -> Memory
+
+D-PHY三种工作模式: 3种逻辑通道
+	csi2_dphy0, 全速模式: 4个lane
+	csi2_dphy1, 拆分模式: lane0和lane1
+	csi2_dphy2, 拆分模式: lane2和lane3
+*/
+// ================================== Sensor =====================================
+&i2c4 {
+	status = "okay";
+	clock-frequency = <400000>;
+
+	// 手册显示, 其地址有: 0x34/0x36/0x3A/0x3C 写地址
+	// SLAMODE0/SLAMODE1引脚决定
+	imx415: imx415@1a {
+		status = "okay";
+		compatible = "sony,imx415";
+		/*地址*/
+		reg = <0x1a>;
+		/*电源, 复位*/
+		power-domains = <&power RK3568_PD_VI>;
+		reset-gpios = <&gpio3 RK_PB6 GPIO_ACTIVE_LOW>;
+		power-gpios = <&gpio4 RK_PB4 GPIO_ACTIVE_HIGH>;
+		/*时钟*/
+		clocks = <&cru CLK_CIF_OUT>;
+		clock-names = "xvclk";
+		/*输入, 输出*/
+		pinctrl-names = "rockchip,camera_default";
+		pinctrl-0 = <&cif_clk>;
+
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "CMK-OT1522-FG3";
+		rockchip,camera-module-lens-name = "CS-P1150-IRC-8M-FAU";
+		port {
+			imx415_out: endpoint {
+				remote-endpoint = <&mipi_in_ucam1>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+	};
+};
+
+// ================================== MIPI D-PHY =====================================
+&csi2_dphy_hw {
+	status = "okay";
+};
+
+
+&csi2_dphy0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* 表示输入端口 */
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* 物理MIPI D-PHY只能接收一路MIPI信号 */
+			mipi_in_ucam1: endpoint@2 {
+				reg = <2>;
+				remote-endpoint = <&imx415_out>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			csidphy_out: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&isp0_in>;
+			};
+		};
+	};
+};
+
+// ================================== MIPI CSI 2 =====================================
+
+
+
+// ================================== MIPI ISP =====================================
+&rkisp {
+	status = "okay";
+};
+
+&rkisp_mmu {
+	status = "okay";
+};
+
+&rkisp_vir0 {
+	status = "okay";
+
+	port {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		isp0_in: endpoint@0 {
+			reg = <0>;
+			remote-endpoint = <&csidphy_out>;
+		};
+	};
+};
